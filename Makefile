@@ -17,12 +17,12 @@ else
 endif
 
 # Source files
-THRUST_SRC = src/thrust_sort.cpp
-SINGLE_SRC = src/singlethread_sort.cpp
-MULTI_SRC = src/multithread_sort.cpp
+THRUST_SRC = sort/thrust_sort.cu
+SINGLE_SRC = sort/singlethread_sort.cu
+MULTI_SRC = sort/multithread_sort.cu
 
 # Executable names
-THRUST_EXE = thrust_sort
+THRUST_EXE = thrust
 SINGLE_EXE = singlethread
 MULTI_EXE = multithread
 
