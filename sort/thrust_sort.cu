@@ -5,83 +5,58 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
-
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
-#include <thrust/sort.h>
 #include <cuda_runtime.h>
 
 using namespace std;
 
-/**********************************************************
- * **********************************************************
- * error checking stufff
- ***********************************************************
- ***********************************************************/
-// Enable this for error checking
+// Error checking macros for CUDA
 #define CUDA_CHECK_ERROR
 #define CudaSafeCall(err) __cudaSafeCall(err, __FILE__, __LINE__)
 #define CudaCheckError() __cudaCheckError(__FILE__, __LINE__)
-inline void __cudaSafeCall(cudaError err,
-                           const char *file, const int line)
+
+// Safe CUDA call implementation
+inline void __cudaSafeCall(cudaError err, const char *file, const int line)
 {
 #ifdef CUDA_CHECK_ERROR
-#pragma warning(push)
-#pragma warning(disable : 4127)
     do
     {
         if (cudaSuccess != err)
         {
-            fprintf(stderr,
-                    "cudaSafeCall() failed at %s:%i : %s\n",
+            fprintf(stderr, "cudaSafeCall() failed at %s:%i : %s\n",
                     file, line, cudaGetErrorString(err));
             exit(-1);
         }
     } while (0);
-#pragma warning(pop)
 #endif
     return;
 }
+
+// CUDA error checking implementation
 inline void __cudaCheckError(const char *file, const int line)
 {
 #ifdef CUDA_CHECK_ERROR
-#pragma warning(push)
-#pragma warning(disable : 4127)
     do
     {
         cudaError_t err = cudaGetLastError();
         if (cudaSuccess != err)
         {
-            fprintf(stderr,
-                    "cudaCheckError() failed at %s:%i : %s.\n",
+            fprintf(stderr, "cudaCheckError() failed at %s:%i : %s.\n",
                     file, line, cudaGetErrorString(err));
             exit(-1);
         }
-        // More careful checking. However, this will affect performance.
-        // Comment if not needed.
         err = cudaDeviceSynchronize();
         if (cudaSuccess != err)
         {
-            fprintf(stderr,
-                    "cudaCheckError() with sync failed at %s:%i : %s.\n",
+            fprintf(stderr, "cudaCheckError() with sync failed at %s:%i : %s.\n",
                     file, line, cudaGetErrorString(err));
             exit(-1);
         }
     } while (0);
-#pragma warning(pop)
 #endif
     return;
 }
-/***************************************************************
- * **************************************************************
- * end of error checking stuff
- ****************************************************************
- ***************************************************************/
 
-// function takes an array pointer, and the number of rows and cols in the array, and
-// allocates and intializes the array to a bunch of random numbers
-// Note that this function creates a 1D array that is a flattened 2D array
-// to access data item data[i][j], you must can use data[(i*rows) + j]
+// Function to create random array
 int *makeRandArray(const int size, const int seed)
 {
     srand(seed);
@@ -93,109 +68,266 @@ int *makeRandArray(const int size, const int seed)
     return array;
 }
 
-//*******************************//
-// your kernel here!!!!!!!!!!!!!!!!!
-//*******************************//
-__global__ void matavgKernel(...)
+// Kernel to compute histogram for radix sort - counts 0s and 1s for current bit
+__global__ void computeHistogram(int *input, int *histogram, int bit, int size, int numBlocks)
 {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    // Shared memory for block-level histogram (2 bins for 0 and 1)
+    __shared__ int blockHistogram[2];
+
+    // Initialize shared memory histogram
+    if (threadIdx.x < 2)
+    {
+        blockHistogram[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    // Each thread processes 4 elements for better GPU utilization
+    const int elementsPerThread = 4;
+    for (int i = 0; i < elementsPerThread; i++)
+    {
+        int elementIdx = idx * elementsPerThread + i;
+        if (elementIdx < size)
+        {
+            int value = input[elementIdx];
+            int digit = (value >> bit) & 1;       // Extract current bit
+            atomicAdd(&blockHistogram[digit], 1); // Atomic update of histogram
+        }
+    }
+    __syncthreads();
+
+    // Store block histogram to global memory
+    if (threadIdx.x < 2)
+    {
+        int blockId = blockIdx.x;
+        histogram[blockId * 2 + threadIdx.x] = blockHistogram[threadIdx.x];
+    }
 }
 
-void printArray(const thrust::host_vector<int> &array, int size)
+// Kernel to compute prefix sum (inclusive scan) for histogram
+__global__ void computePrefixSum(int *input, int *output, int size)
 {
-    for (int i = 0; i < size; ++i)
+    extern __shared__ int temp[]; // Dynamic shared memory allocation
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    // Load data from global to shared memory
+    if (idx < size)
     {
-        std::cout << array[i] << " ";
+        temp[tid] = input[idx];
     }
-    std::cout << std::endl;
+    else
+    {
+        temp[tid] = 0;
+    }
+    __syncthreads();
+
+    // Parallel prefix sum algorithm
+    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    {
+        if (tid >= stride)
+        {
+            temp[tid] += temp[tid - stride];
+        }
+        __syncthreads();
+    }
+
+    // Write result back to global memory
+    if (idx < size)
+    {
+        output[idx] = temp[tid];
+    }
+}
+
+// Kernel to scatter elements to correct positions based on radix digit
+__global__ void scatterElements(int *input, int *output, int *globalPrefix, int bit, int size, int numBlocks)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    // Shared memory for block offsets
+    __shared__ int blockOffset[2];
+
+    // Load block offsets from global prefix sum
+    if (threadIdx.x < 2)
+    {
+        int blockId = blockIdx.x;
+        // Get cumulative counts from previous blocks
+        blockOffset[threadIdx.x] = (blockId > 0) ? globalPrefix[blockId * 2 + threadIdx.x - 1] : 0;
+    }
+    __syncthreads();
+
+    // Each thread processes multiple elements
+    const int elementsPerThread = 4;
+    for (int i = 0; i < elementsPerThread; i++)
+    {
+        int elementIdx = idx * elementsPerThread + i;
+        if (elementIdx < size)
+        {
+            int value = input[elementIdx];
+            int digit = (value >> bit) & 1; // Extract current bit
+
+            // Calculate correct position in output array
+            int position;
+            if (digit == 0)
+            {
+                // Place in zeros section
+                position = blockOffset[0];
+                blockOffset[0]++;
+            }
+            else
+            {
+                // Place in ones section (after all zeros)
+                int totalZeros = globalPrefix[numBlocks * 2 - 1]; // Last element of prefix sum
+                position = totalZeros + blockOffset[1];
+                blockOffset[1]++;
+            }
+
+            // Scatter element to correct position
+            if (position < size)
+            {
+                output[position] = value;
+            }
+        }
+    }
 }
 
 int main(int argc, char *argv[])
 {
-    int *h_array;   // the pointer to the array of rands on host
-    int size, seed; // values for the size of the array
-    bool printSorted = false;
-    // and the seed for generating
-    // random numbers
-    // check the command line args
-    if (argc < 3)
+    int *array;               // Pointer to input array
+    int size, seed;           // Array size and random seed
+    bool printSorted = false; // Flag to control output printing
+
+    // Command line argument validation
+    if (argc < 4)
     {
-        std::cerr << "usage: "
-                  << argv[0]
-                  << " [number of random integers to generate] [seed value for random number generation]"
-                  << std::endl;
+        std::cerr << "usage: " << argv[0]
+                  << " [amount of random nums to generate] [seed value for rand]"
+                  << " [1 to print sorted array, 0 otherwise]" << std::endl;
         exit(-1);
     }
+
+    // Parse array size from command line
     {
-        // convert cstrings to ints
         std::stringstream ss1(argv[1]);
         ss1 >> size;
     }
+    // Parse random seed from command line
     {
         std::stringstream ss1(argv[2]);
         ss1 >> seed;
     }
+    // Parse print flag from command line
     {
+        int sortPrint;
+        std::stringstream ss1(argv[3]);
+        ss1 >> sortPrint;
+        if (sortPrint == 1)
+            printSorted = true;
     }
 
-    // get the random numbers
-    h_array = makeRandArray(size, seed);
+    // Generate random input array
+    array = makeRandArray(size, seed);
 
-    /***********************************
-     * create a cuda timer to time execution
-     **********************************/
+    // CUDA events for timing measurement
     cudaEvent_t startTotal, stopTotal;
     float timeTotal;
-    CudaSafeCall(cudaEventCreate(&startTotal));
-    CudaSafeCall(cudaEventCreate(&stopTotal));
-    CudaSafeCall(cudaEventRecord(startTotal, 0));
-    /***********************************
-     * end of cuda timer creation
-     **********************************/
+    cudaEventCreate(&startTotal);
+    cudaEventCreate(&stopTotal);
+    cudaEventRecord(startTotal, 0);
 
-    /////////////////////////////////////////////////////////////////////
-    /////////////////////// YOUR CODE HERE ///////////////////////
-    /////////////////////////////////////////////////////////////////////
+    // Device memory pointers
+    int *d_array, *d_temp, *d_histogram, *d_prefix;
 
-    thrust::device_vector<int> d_array(h_array, h_array + size);
+    // Allocate device memory
+    CudaSafeCall(cudaMalloc(&d_array, size * sizeof(int)));
+    CudaSafeCall(cudaMalloc(&d_temp, size * sizeof(int)));
 
-    thrust::sort(d_array.begin(), d_array.end());
+    // Calculate GPU execution configuration
+    int threadsPerBlock = 256;
+    int numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
 
-    CudaCheckError();
-
-    thrust::host_vector<int> h_result;
-    if (printSorted)
+    // Ensure massive parallelism for large arrays (meets project requirement)
+    if (size >= 1000000)
     {
-        h_result = d_array;
+        numBlocks = 1024;      // Use 1024 blocks for maximum parallelism
+        threadsPerBlock = 256; // Total threads: 1024 * 256 = 262,144
     }
 
-    /////////////////////////////////////////////////////////////////////
-    /////////////////////// END OF YOUR CODE ///////////////////////
-    /////////////////////////////////////////////////////////////////////
+    // Allocate memory for histogram and prefix sum arrays
+    int histogramSize = numBlocks * 2; // 2 digits (0 and 1) per block
+    CudaSafeCall(cudaMalloc(&d_histogram, histogramSize * sizeof(int)));
+    CudaSafeCall(cudaMalloc(&d_prefix, histogramSize * sizeof(int)));
 
-    /***********************************
-     * Stop and destroy the cuda timer
-     **********************************/
-    CudaSafeCall(cudaEventRecord(stopTotal, 0));
-    CudaSafeCall(cudaEventSynchronize(stopTotal));
-    CudaSafeCall(cudaEventElapsedTime(&timeTotal, startTotal, stopTotal));
-    CudaSafeCall(cudaEventDestroy(startTotal));
-    CudaSafeCall(cudaEventDestroy(stopTotal));
-    /***********************************
-     * end of cuda timer destruction
-     **********************************/
+    // Copy input data from host to device
+    CudaSafeCall(cudaMemcpy(d_array, array, size * sizeof(int), cudaMemcpyHostToDevice));
 
-    delete[] h_array;
+    // Buffer pointers for ping-pong between iterations
+    int *current = d_array;
+    int *next = d_temp;
 
-    std::cerr << "Total time in seconds: "
-              << timeTotal / 1000.0 << std::endl;
-
-    if (printSorted)
+    // Radix sort: process each bit from LSB to MSB (32 bits for integers)
+    for (int bit = 0; bit < 32; bit++)
     {
-        ///////////////////////////////////////////////
-        /// Your code to print the sorted array here //
-        ///////////////////////////////////////////////
-        printArray(h_result, size);
+        // Step 1: Compute histogram of digits for current bit
+        computeHistogram<<<numBlocks, threadsPerBlock>>>(current, d_histogram, bit, size, numBlocks);
+        CudaCheckError();
+
+        // Step 2: Compute prefix sum of histogram (exclusive scan)
+        computePrefixSum<<<1, histogramSize, histogramSize * sizeof(int)>>>(d_histogram, d_prefix, histogramSize);
+        CudaCheckError();
+
+        // Step 3: Scatter elements to correct positions based on digit
+        scatterElements<<<numBlocks, threadsPerBlock>>>(current, next, d_prefix, bit, size, numBlocks);
+        CudaCheckError();
+
+        // Swap buffers for next iteration
+        int *temp = current;
+        current = next;
+        next = temp;
     }
 
+    // Ensure final result is in d_array
+    if (current != d_array)
+    {
+        CudaSafeCall(cudaMemcpy(d_array, current, size * sizeof(int), cudaMemcpyDeviceToDevice));
+    }
+
+    // Copy sorted result back to host
+    CudaSafeCall(cudaMemcpy(array, d_array, size * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CudaSafeCall(cudaFree(d_array));
+    CudaSafeCall(cudaFree(d_temp));
+    CudaSafeCall(cudaFree(d_histogram));
+    CudaSafeCall(cudaFree(d_prefix));
+
+    // Stop timer and calculate elapsed time
+    cudaEventRecord(stopTotal, 0);
+    cudaEventSynchronize(stopTotal);
+    cudaEventElapsedTime(&timeTotal, startTotal, stopTotal);
+    cudaEventDestroy(startTotal);
+    cudaEventDestroy(stopTotal);
+
+    // Print execution time (required by project)
+    std::cerr << "Total time in seconds: " << timeTotal / 1000.0 << std::endl;
+
+    // Optional: Print sorted array if requested
+    if (printSorted)
+    {
+        int elementsToShow = (size > 100) ? 100 : size;
+        for (int i = 0; i < elementsToShow; i++)
+        {
+            std::cout << array[i] << " ";
+        }
+        if (size > 100)
+        {
+            std::cout << "... (showing first 100 of " << size << " elements)";
+        }
+        std::cout << std::endl;
+    }
+
+    // Cleanup host memory
+    delete[] array;
     return 0;
 }
