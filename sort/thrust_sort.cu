@@ -309,10 +309,9 @@ int main(int argc, char *argv[])
     cudaEventDestroy(startTotal);
     cudaEventDestroy(stopTotal);
 
-    // Print execution time (required by project)
+    // Print execution time
     std::cerr << "Total time in seconds: " << timeTotal / 1000.0 << std::endl;
 
-    // Optional: Print sorted array if requested
     if (printSorted)
     {
         int elementsToShow = (size > 100) ? 100 : size;
